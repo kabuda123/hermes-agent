@@ -351,14 +351,43 @@ def _hydrate_hit(db, lineage_root: str, match_info: Dict[str, Any], result_detai
         detail=result_detail)
 
 
+def _profile_from_session_metadata(session: Dict[str, Any]) -> str:
+    """Ownership of legacy mixed-profile rows in a multiplex database."""
+    explicit = str(session.get("profile_name") or "").strip()
+    if explicit:
+        return explicit
+    parts = str(session.get("session_key") or "").split(":", 2)
+    if len(parts) >= 2 and parts[0] == "agent" and parts[1]:
+        return "default" if parts[1] == "main" else parts[1]
+    return "default"
+
+
+def _session_profiles_by_id(db, session_ids) -> Dict[str, str]:
+    ids = list(dict.fromkeys(str(sid) for sid in session_ids if sid))
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    with db._lock:
+        rows = db._conn.execute(
+            "SELECT id, profile_name, session_key FROM sessions "
+            f"WHERE id IN ({placeholders})", ids).fetchall()
+    return {str(row["id"]): _profile_from_session_metadata(dict(row)) for row in rows}
+
+
 def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort: Optional[str],
               detail: str, current_session_id: str = None, link_profile: str = None,
               after_ts: Optional[int] = None, before_ts: Optional[int] = None,
               exclude_session_ids: Optional[List[str]] = None) -> str:
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+    session_profile = _session_profiles_by_id(db, [current_session_id]).get(current_session_id)
+    link_profile = link_profile or session_profile
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
     title_result = _title_match_result(db, query, current_lineage_root)
+    if title_result and session_profile:
+        title_sid = title_result["session_id"]
+        if _session_profiles_by_id(db, [title_sid]).get(title_sid) != session_profile:
+            title_result = None
     # FTS rows are time-bounded in SQL (_search_filter_clauses); the title match bypasses that
     # query, so it is the one place the window is re-checked in Python.
     if title_result:
@@ -369,9 +398,13 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     raw_results, err = _loud(lambda: db.search_messages(
         query=query, role_filter=role_filter or ["user", "assistant"],
         exclude_sources=list(_HIDDEN_SESSION_SOURCES), limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort,
-        fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts), "FTS5 search failed: %s", "Search failed")
+        fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts,
+        **({"session_profile": session_profile} if session_profile else {})), "FTS5 search failed: %s", "Search failed")
     if err:
         return err
+    if session_profile:
+        profiles = _session_profiles_by_id(db, [r["session_id"] for r in raw_results])
+        raw_results = [r for r in raw_results if profiles.get(r["session_id"]) == session_profile]
     # Demote cron rows below interactive ones BEFORE dedup so a high-volume cron corpus
     # can't starve the user's own sessions out of the top `limit`; stable sort keeps BM25
     # order within each class.
@@ -489,16 +522,22 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         bounded_list = getattr(db, "list_recent_sessions_bounded", None)
         if bounded_list is None:
             raise RuntimeError("session database does not support bounded recent-session browse")
+        session_profile = _session_profiles_by_id(db, [current_session_id]).get(current_session_id)
         sessions = bounded_list(
             limit=limit + 15,  # extra so we can skip current / compression roots
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES), timeout_seconds=3.0)
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES), timeout_seconds=3.0,
+            **({"session_profile": session_profile} if session_profile else {}))
+        profiles = _session_profiles_by_id(db, [current_session_id, *(s.get("id") for s in sessions)])
+        session_profile = profiles.get(current_session_id)
+        if session_profile:
+            sessions = [s for s in sessions if profiles.get(s.get("id")) == session_profile]
         current_root, has_compression_hop = (
             _resolve_to_parent(db, current_session_id) if current_session_id else (None, False))
         # Compression continuation: the root was summarised into the live child, so hide
         # it. /new-reset children carry no transcript — keep that root browsable.
         hidden = {current_session_id, current_root if has_compression_hop and current_root else None}
         results = [{
-            "session_id": s.get("id", ""), "link": _session_link(s.get("id", ""), link_profile),
+            "session_id": s.get("id", ""), "link": _session_link(s.get("id", ""), link_profile or session_profile),
             "title": s.get("title") or None, **{k: s.get(k, "") for k in ("source", "started_at", "last_active")},
             "message_count": s.get("message_count", 0), "preview": s.get("preview", "")}
             for s in [x for x in sessions if x.get("id", "") not in hidden][:limit]]

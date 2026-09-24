@@ -1165,7 +1165,12 @@ class GatewayStartupMixin:
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
-            adapter = self._create_adapter(platform, platform_config)
+            if _multiplex_on:
+                from gateway.run import _profile_runtime_scope, get_hermes_home
+                with _profile_runtime_scope(get_hermes_home()):
+                    adapter = self._create_adapter(platform, platform_config)
+            else:
+                adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 if platform.value in {m.value for m in Platform.__members__.values()}:

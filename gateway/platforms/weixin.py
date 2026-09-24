@@ -216,6 +216,18 @@ class ContextTokenStore:
             payload = {key[len(prefix):]: value for key, value in self._cache.items() if key.startswith(prefix)}
             await asyncio.to_thread(self._persist, account_id, payload)
 
+    async def delete(self, account_id: str, user_id: str, expected_token: str) -> bool:
+        """Remove a rejected token without discarding a newer inbound token."""
+        async with self._persist_lock:
+            key = self._key(account_id, user_id)
+            if self._cache.get(key) != expected_token:
+                return False
+            self._cache.pop(key, None)
+            prefix = f"{account_id}:"
+            payload = {key[len(prefix):]: value for key, value in self._cache.items() if key.startswith(prefix)}
+            await asyncio.to_thread(self._persist, account_id, payload)
+            return True
+
     def _persist(self, account_id: str, payload: Dict[str, str]) -> None:
         try:
             atomic_json_write(self._root / f"{account_id}.context-tokens.json", payload)
@@ -970,6 +982,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
         session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
         async with self._send_text_gate:
+            context_token = self._token_store.get(self._account_id, chat_id)
             last_error: Optional[Exception] = None
             retried_without_token = False
             attempt = 0  # counts real failures only — the tokenless re-send must not eat the retry budget
@@ -984,8 +997,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
                         errmsg = resp.get("errmsg") or resp.get("msg")
                         if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
+                            stale_token = context_token
                             retried_without_token, context_token = True, None
-                            self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
+                            await self._token_store.delete(self._account_id, chat_id, stale_token)
                             logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
                             continue
                         if _is_stale_session_ret(ret, errcode, errmsg):
@@ -1169,8 +1183,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 # Same stale-session fallback as _send_text_chunk: re-send once without context_token. Clearing the
                 # token also covers the remaining item lists (caption, then media) and bounds this loop.
                 if _is_session_expired(resp, ret, errcode) and context_token:
+                    stale_token = context_token
                     context_token = None
-                    self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
+                    await self._token_store.delete(self._account_id, chat_id, stale_token)
                     logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")

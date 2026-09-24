@@ -555,7 +555,7 @@ class GatewayTurnMixin:
         turn_sidecar_notes.append(context_note)
 
         try:
-            should_notify = reset_reason == "suspended"
+            should_notify = reset_reason == "suspended" and source.platform != Platform.WEIXIN
             adapter = self._delivery_adapter_for(source) if should_notify else None
             if adapter:
                 notice = (
@@ -1438,7 +1438,7 @@ class GatewayTurnMixin:
                 turn_sidecar_notes.append(_intro_note)
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
-        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
+        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK, Platform.WEIXIN):
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)

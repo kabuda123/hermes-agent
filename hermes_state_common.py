@@ -21,6 +21,19 @@ TITLE_SOURCE_LLM = "llm"
 TITLE_SOURCE_USER = "user"
 
 
+def _sql_session_profile(alias: str = "s") -> str:
+    """Owner expression for modern and legacy multiplex session rows."""
+    key_tail = f"substr({alias}.session_key, 7)"
+    key_profile = f"substr({key_tail}, 1, instr({key_tail}, ':') - 1)"
+    return (
+        f"COALESCE(NULLIF(TRIM({alias}.profile_name), ''), "
+        f"CASE WHEN substr({alias}.session_key, 1, 6) = 'agent:' "
+        f"AND instr({key_tail}, ':') > 1 THEN "
+        f"CASE WHEN {key_profile} = 'main' THEN 'default' ELSE {key_profile} END "
+        "ELSE 'default' END)"
+    )
+
+
 # Session preview = head of the first user message (shown when a session has no title).  A /skill invocation
 # embeds the whole skill body, so scaffolded rows take a wider excerpt (whole message under budget, else head +
 # tail where the typed instruction lands) and ``_shape_preview`` recovers ``/work — fix ...`` from it.

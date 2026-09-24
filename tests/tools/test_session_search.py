@@ -29,6 +29,22 @@ def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
 
 
+@pytest.mark.parametrize("query", ["", "needle"])
+def test_other_profile_cannot_fill_candidate_limit(db, query):
+    db.create_session("current", source="weixin", profile_name="default")
+    db.create_session("own", source="weixin", session_key="agent:main:weixin:dm:peer")
+    db.append_message("own", role="user", content="needle")
+    for i in range(310):
+        sid = f"foreign-{i}"
+        db.create_session(sid, source="weixin", profile_name="home")
+        db.append_message(sid, role="user", content="needle")
+        db._conn.execute("UPDATE sessions SET started_at = ?, last_activity_at = ? WHERE id = ?",
+                         (2000000000 + i, 2000000000 + i, sid))
+    db._conn.commit()
+    result = json.loads(session_search(db=db, query=query, current_session_id="current", sort="newest"))
+    assert [entry["session_id"] for entry in result["results"]] == ["own"]
+
+
 def _seed_modpack_sessions(db):
     """Create three sessions about a modpack so FTS5 has hits to dedupe."""
     now = int(time.time())
@@ -165,6 +181,42 @@ class TestBrowseShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_browse_excludes_sessions_owned_by_another_profile(self, db):
+        db.create_session(
+            "s_current_default",
+            source="weixin",
+            session_key="agent:main:weixin:dm:default-user",
+        )
+        db.append_message(
+            "s_current_default", role="user", content="current default message"
+        )
+        db.create_session(
+            "s_default_history",
+            source="weixin",
+            session_key="agent:main:weixin:dm:default-history",
+        )
+        db.append_message(
+            "s_default_history", role="user", content="older default message"
+        )
+        db.create_session(
+            "s_home_history",
+            source="weixin",
+            session_key="agent:home:weixin:dm:home-history",
+            profile_name="home",
+        )
+        db.append_message(
+            "s_home_history", role="user", content="private home message"
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(db=db, current_session_id="s_current_default", limit=10)
+        )
+        session_ids = [entry["session_id"] for entry in result["results"]]
+
+        assert "s_default_history" in session_ids
+        assert "s_home_history" not in session_ids
+
 
 # =========================================================================
 # Discovery shape (with query)
@@ -263,6 +315,83 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_discovery_excludes_matches_owned_by_another_profile(self, db):
+        db.create_session(
+            "s_current_default",
+            source="weixin",
+            session_key="agent:main:weixin:dm:default-user",
+        )
+        db.append_message(
+            "s_current_default", role="user", content="current gateway message"
+        )
+        db.create_session(
+            "s_default_history",
+            source="weixin",
+            session_key="agent:main:weixin:dm:default-history",
+        )
+        db.append_message(
+            "s_default_history", role="user", content="portfolio isolation marker"
+        )
+        db.create_session(
+            "s_home_history",
+            source="weixin",
+            session_key="agent:home:weixin:dm:home-history",
+            profile_name="home",
+        )
+        db.append_message(
+            "s_home_history", role="user", content="portfolio isolation marker"
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                query="portfolio isolation marker",
+                db=db,
+                current_session_id="s_current_default",
+                limit=10,
+            )
+        )
+        session_ids = [entry["session_id"] for entry in result["results"]]
+
+        assert "s_default_history" in session_ids
+        assert "s_home_history" not in session_ids
+
+    def test_discovery_excludes_title_match_owned_by_another_profile(self, db):
+        db.create_session(
+            "s_current_default",
+            source="weixin",
+            session_key="agent:main:weixin:dm:default-user",
+        )
+        db.append_message(
+            "s_current_default", role="user", content="current gateway message"
+        )
+        db.create_session(
+            "s_home_history",
+            source="weixin",
+            session_key="agent:home:weixin:dm:home-history",
+            profile_name="home",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Private Home Portfolio", "s_home_history"),
+        )
+        db.append_message(
+            "s_home_history", role="user", content="unrelated private message"
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                query="Private Home Portfolio",
+                db=db,
+                current_session_id="s_current_default",
+                limit=10,
+            )
+        )
+        session_ids = [entry["session_id"] for entry in result["results"]]
+
+        assert "s_home_history" not in session_ids
 
 
 class TestDiscoverySort:

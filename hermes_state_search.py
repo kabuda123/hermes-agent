@@ -17,6 +17,7 @@ from hermes_state_common import (
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
+    _sql_session_profile,
 )
 
 # Pre-split logger identity so log filtering/capture is unchanged.
@@ -138,7 +139,8 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: List[str], order_
 def _search_filter_clauses(
     where: List[str], params: list, *, include_inactive: bool, source_filter: Optional[List[str]],
     exclude_sources: Optional[List[str]], role_filter: Optional[List[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    session_profile: Optional[str] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -163,6 +165,9 @@ def _search_filter_clauses(
     if before_ts is not None:
         where.append("s.started_at < ?")
         params.append(int(before_ts))
+    if session_profile is not None:
+        where.append(f"{_sql_session_profile()} = ?")
+        params.append(session_profile)
 
 
 class SessionSearchMixin:
@@ -1040,6 +1045,7 @@ class SessionSearchMixin:
         role_filter: List[str] = None, limit: int = 20, offset: int = 0, sort: str = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        session_profile: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
@@ -1049,7 +1055,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, session_profile=session_profile)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1063,6 +1069,7 @@ class SessionSearchMixin:
         role_filter: List[str] = None, limit: int = 20, offset: int = 0, sort: str = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        session_profile: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1079,7 +1086,7 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts, session_profile=session_profile)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
@@ -1187,7 +1194,7 @@ class SessionSearchMixin:
         like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
         like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
-                                         "after_ts", "before_ts")}
+                                         "after_ts", "before_ts", "session_profile")}
         _search_filter_clauses(like_where, like_params, **filters)
         # instr() for the snippet uses the first search token.
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
