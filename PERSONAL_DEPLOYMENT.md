@@ -1,6 +1,6 @@
 # 个人部署与定制说明
 
-更新日期：2026-09-24。基于官方 Hermes Agent **0.21.4**，固定上游提交 `02ed55e572a96246d34f0e2fb3aa51197db50df5`，集成分支为 `integration/official-weixin-quiet`。
+更新日期：2026-10-04。基于官方 Hermes Agent **0.21.4**，固定上游提交 `02ed55e572a96246d34f0e2fb3aa51197db50df5`，集成分支为 `integration/official-weixin-quiet`。核心已发布；原生 Dashboard 已完成本机启动与认证保护验证，公网切换及正式对话验收尚未完成。
 
 ## 运行结构
 
@@ -9,6 +9,8 @@ CLI、Gateway 和独立 Web UI 的 Python Bridge 使用同一套核心源码及�
 `default`、`home` 是两套独立 profile，共用一个 multiplex Gateway：default 承载微信、企业微信和 API，home 承载微信。只共享代码和依赖，不合并配置、凭据、会话、记忆、绑定或定时任务。Web UI Bridge 保留 profile 选择与隔离。
 
 Gateway 与 Web UI 分别仅监听本机 8643、8658。其他项目与反向代理未随本次发布调整。
+
+原生 Dashboard 作为独立后台验证进程监听本机 9119，显式使用 `-p default`，识别 default、home 两套 profile。尚未纳入 systemd 或开机自启，也未替换独立 Web UI 的公网入口。
 
 ## 定制变更
 
@@ -53,4 +55,47 @@ CLI 启动脚本指向新环境；Gateway 专属 systemd 覆盖调整 PATH 和�
 - CLI 与 Bridge 使用新版核心；两套微信、企业微信及 API 已连接；网页及 API 健康检查正常，启动日志未发现错误。
 - 这些检查不代表全量项目测试或真实账号对话验收。两个微信账号及网页模型对话仍待用户手工验收。
 
-本文件不记录服务器地址、账号凭据、私钥、真实配置值或用户会话内容。
+## 发布记录
+
+| 日期 | 发布内容 | 验证边界 |
+| --- | --- | --- |
+| 2026-09-24 | 0.21.4 加定制补丁，统一 CLI、Gateway、Web UI Bridge 核心 | 168 项相关测试通过；真实消息验收待完成 |
+| 2026-09-24 | 构建原生 Dashboard 前端，验证隔离配置与数据库副本 | 测试账号登录、静态资源、两个 profile 会话读取、WebSocket 握手及数据库完整性通过；隔离实例已停止 |
+| 2026-10-04 | 启用 `dashboard_auth/basic`，显式选择 default 启动本机 Dashboard | 登录页 200、首页 302、状态接口 200；认证门禁启用，未认证 API / WebSocket 被拒绝；正式账号登录和模型对话未验证 |
+
+本次正式配置仅增加认证插件，复用已有凭据；home 配置及两套凭据文件摘要不变。Gateway、Web UI、Nginx 在操作前后的 PID 和状态一致，消息/API 通道仍 connected。
+
+## Dashboard 发布流程
+
+1. 核对发布目录、全局 active profile、端口和运行服务；备份配置及一致性数据库副本，备份不进入仓库。
+2. 按当前源码 engines 选择 Node/npm，使用锁文件安装 Web 工作区并构建。本次 npm 11.16.0 被拒绝，改用发布目录缓存中的 npm 11.17.0，未升级系统工具：
+
+   ```bash
+   export npm_config_cache="$PWD/.dashboard-npm-cache"
+   export NODE_OPTIONS=--max-old-space-size=1024
+   npm exec --yes --package=npm@11.17.0 -- npm ci --workspace web --include-workspace-root=false --no-audit --no-fund
+   npm exec --yes --package=npm@11.17.0 -- npm run build --workspace web
+   ```
+
+3. 使用隔离 HERMES_HOME、测试认证配置和数据库副本验证；不复制渠道凭据，不连接真实消息平台或 MCP，不发送模型消息。
+4. 确认 default 的认证配置及 `plugins.enabled` 中包含 `dashboard_auth/basic`，保留其他配置。将 `HERMES_HOME` 指向正式数据根目录、`HERMES_WEB_DIST` 指向当前发布的 `hermes_cli/web_dist`，并通过 `HERMES_DASHBOARD_PUBLIC_URL` 声明实际外部访问域名以启用密码门禁。
+5. 用当前发布环境执行 `hermes -p default dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build`。显式 profile 防止机器上 active profile 与认证凭据所属 profile 不同；该命令本身不配置后台托管。
+6. 检查页面和静态资源、`auth_required`、认证正反向路径、profile 及 WebSocket，复核既有服务。正式密码登录和模型调用单独验收，不能仅凭状态接口判定对话可用。
+7. 进程托管、反向代理和公网入口切换需明确实施范围并验证后，再停止独立 Web UI。当前未完成这一步。
+
+回退时只停止核实身份后的新增 Dashboard 进程，并恢复本次插件字段，不覆盖后续其他配置。涉及数据库不兼容迁移时沿用前述一致性备份回退规则。
+
+## 已知问题与修复记录
+
+| 问题 | 修复 / 状态 |
+| --- | --- |
+| 缺少前端构建产物 | 已构建 `hermes_cli/web_dist`，静态资源验证通过 |
+| npm `EBADENGINE` | 使用符合当前项目约束的 npm 11.17.0，安装与构建通过 |
+| 本机模式下密码登录后认证 API 不可用 | 显式声明外部 public URL 启用认证中间件；隔离登录、API 与 WS 握手通过 |
+| 保存密码后仍无认证 provider | 启用 basic 插件并显式选择持有认证配置的 default；本机启动通过 |
+| 旧公网后台 502 | 旧反向代理未指向新 Dashboard 端口，尚未修复和重新验收 |
+| Dashboard 自动恢复与开机自启 | 当前仅后台验证进程，尚未实施服务托管 |
+
+独立 Web UI 停止时不会连带停止共享 Gateway，但会停止自己的 Python Bridge 并中断网页操作；现有反向代理不调整则网页入口也会失效。不能把“配置未丢失”视为“全部使用方式不受影响”。
+
+本文件不记录服务器地址、账号凭据、私钥、真实认证值或用户会话内容。环境专属路径、备份位置和检查记录保留在仓库外的 `ARCHITECTURE_AND_PROGRESS.md`。
